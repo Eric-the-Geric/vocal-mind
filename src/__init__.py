@@ -7,6 +7,6 @@ from .recorder import (
     StreamParams
 )
 
-from .transciber import (
+from .transcriber import (
         Transcription
 )
