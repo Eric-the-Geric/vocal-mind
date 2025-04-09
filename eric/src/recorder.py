@@ -107,4 +107,4 @@ class Recorder:
 if __name__ == "__main__":
     stream_params = StreamParams()
     recorder = Recorder(stream_params, stop_phrase="stop recording")
-    recorder.record("audio.wav")
+    recorder.record("audio_test.wav")
