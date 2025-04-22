@@ -5,31 +5,36 @@ import asyncio
 import logging
 import aiohttp
 import websockets
+import pyaudio
+import wave
+import collections
 
+# Get API key
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise ValueError("Missing OpenAI API key.")
 
+# Configure logging
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
+# Global to hold the most recent transcription segment
 final_transcription = ""
 
+def compute_overlap_chunks(rate, chunk_size, overlap_seconds=20):
+    # Calculate how many chunks correspond to the overlap duration
+    return int(rate * overlap_seconds / chunk_size) + 1
+
 async def create_transcription_session():
-    """
-    Create a transcription session via the REST API to obtain an ephemeral token.
-    This endpoint uses the beta header "OpenAI-Beta: assistants=v2".
-    """
     url = "https://api.openai.com/v1/realtime/transcription_sessions"
     payload = {
         "input_audio_format": "pcm16",
         "input_audio_transcription": {
             "model": "gpt-4o-transcribe",
             "language": "en",
-            "prompt": "Transcribe the incoming audio in real time."
+            "prompt": "Transcribe the incoming audio. Do not summarize or translate. Include words like 'uh', 'um', and 'ah'. Be as accurate as possible.",
         },
-    
-        "turn_detection": {"type": "server_vad", "silence_duration_ms": 1000}
+        "turn_detection": None  # disable server VAD
     }
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -40,127 +45,127 @@ async def create_transcription_session():
         async with session.post(url, json=payload, headers=headers) as resp:
             if resp.status != 200:
                 text = await resp.text()
-                raise Exception(f"Failed to create transcription session: {resp.status} {text}")
+                raise Exception(f"Failed to create session: {resp.status} {text}")
             data = await resp.json()
-            ephemeral_token = data["client_secret"]["value"]
-            logger.info("Transcription session created; ephemeral token obtained.")
-            return ephemeral_token
+            token = data["client_secret"]["value"]
+            logger.info("Got ephemeral token.")
+            return token
 
-async def send_audio(ws, file_path: str, chunk_size: int, speech_stopped_event: asyncio.Event):
+async def auto_commit(ws, mic, interval: float, commit_event: asyncio.Event):
     """
-    Read the local ulaw file and send it in chunks.
-    After finishing, wait for 1 second to see if the server auto-commits.
-    If not, send a commit event manually.
+    Periodically send commit events, resending the last audio overlap to avoid dropped words.
     """
-    try:
-        with open(file_path, "rb") as f:
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
-                # Base64-encode the audio chunk.
-                audio_chunk = base64.b64encode(chunk).decode("utf-8")
-                audio_event = {
-                    "type": "input_audio_buffer.append",
-                    "audio": audio_chunk
-                }
-                await ws.send(json.dumps(audio_event))
-                await asyncio.sleep(0.02)  # simulate real-time streaming
-        logger.info("Finished sending audio file.")
+    while not commit_event.is_set():
+        await asyncio.sleep(interval)
+        # resend the overlap buffer
+        for pcm_chunk in list(mic.overlap_buffer):
+            b64 = base64.b64encode(pcm_chunk).decode("utf-8")
+            await ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": b64}))
+        # send commit
+        await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        logger.info("Sent periodic commit event with overlap.")
+    logger.info("Auto-commit stopped.")
 
-        # Wait 1 second to allow any late VAD events before committing.
-        try:
-            await asyncio.wait_for(speech_stopped_event.wait(), timeout=1.0)
-            logger.debug("Speech stopped event received; no manual commit needed.")
-        except asyncio.TimeoutError:
-            commit_event = {"type": "input_audio_buffer.commit"}
-            await ws.send(json.dumps(commit_event))
-            logger.info("Manually sent input_audio_buffer.commit event.")
-    except FileNotFoundError:
-        logger.error(f"Audio file not found: {file_path}")
-    except Exception as e:
-        logger.error("Error sending audio: %s", e)
+async def wait_for_enter_and_commit(ws, mic, commit_event: asyncio.Event):
+    # run blocking input() in executor so it doesn't block the loop
+    await asyncio.get_event_loop().run_in_executor(
+        None, input, "Press Enter to stop recording and send final commit...\n"
+    )
+    # before final commit, resend overlap one last time
+    for pcm_chunk in list(mic.overlap_buffer):
+        b64 = base64.b64encode(pcm_chunk).decode("utf-8")
+        await ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": b64}))
+    await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+    logger.info("Sent manual commit event with overlap.")
+    # stop the mic
+    mic.stop()
+    # signal that final commit was requested
+    commit_event.set()
 
-async def receive_events(ws, speech_stopped_event: asyncio.Event):
-    """
-    Listen for events from the realtime endpoint.
-    Capture transcription deltas and the final complete transcription.
-    Set the speech_stopped_event when a "speech_stopped" event is received.
-    """
+async def receive_events(ws, transcript_file, commit_event: asyncio.Event, final_event: asyncio.Event):
     global final_transcription
     try:
-        async for message in ws:
-            try:
-                event = json.loads(message)
-                event_type = event.get("type")
-                if event_type == "input_audio_buffer.speech_stopped":
-                    logger.debug("Received event: input_audio_buffer.speech_stopped")
-                    speech_stopped_event.set()
-                elif event_type == "conversation.item.input_audio_transcription.delta":
-                    delta = event.get("delta", "")
-                    logger.info("Transcription delta: %s", delta)
-                    final_transcription += delta
-                elif event_type == "conversation.item.input_audio_transcription.completed":
-                    completed_text = event.get("transcript", "")
-                    logger.info("Final transcription completed: %s", completed_text)
-                    final_transcription = completed_text  # Use the completed transcript
-                    break  # Exit after final transcription
-                elif event_type == "error":
-                    logger.error("Error event: %s", event.get("error"))
+        async for msg in ws:
+            event = json.loads(msg)
+            t = event.get("type")
+            if t == "conversation.item.input_audio_transcription.delta":
+                delta = event.get("delta", "")
+                logger.debug("Δ %s", delta)
+                final_transcription += delta
+            elif t == "conversation.item.input_audio_transcription.completed":
+                text = event.get("transcript", "")
+                logger.info("✅ Completed segment: %s", text)
+                # write this segment to the transcript file
+                transcript_file.write(text + "\n")
+                transcript_file.flush()
+                if not commit_event.is_set():
+                    # a periodic (partial) segment, reset buffer for the next segment
+                    final_transcription = ""
                 else:
-                    logger.debug("Received event: %s", event_type)
-            except Exception as ex:
-                logger.error("Error processing message: %s", ex)
+                    # final segment, signal and exit
+                    final_transcription = text
+                    final_event.set()
+                    break
+            elif t == "error":
+                logger.error("Error event: %s", event.get("error"))
+            else:
+                logger.debug("Event: %s", t)
     except Exception as e:
-        logger.error("Error receiving events: %s", e)
-
-
-import pyaudio
-import threading
+        logger.error("receive_events error: %s", e)
+        # ensure we unblock the main flow
+        final_event.set()
 
 class MicrophoneStreamer:
-    def __init__(self, ws, chunk_size=1024, rate=16000, format=pyaudio.paInt16):
+    def __init__(self, ws, chunk_size=1024, rate=16000, fmt=pyaudio.paInt16, wav_filename="output.wav"):
         self.ws = ws
         self.chunk_size = chunk_size
         self.rate = rate
-        self.format = format
-        self.channels = 1
+        self.format = fmt
         self.p = pyaudio.PyAudio()
         self.stream = None
         self.running = False
+        # Set up wave file for local recording
+        self.wav_file = wave.open(wav_filename, "wb")
+        self.wav_file.setnchannels(1)
+        self.wav_file.setsampwidth(self.p.get_sample_size(self.format))
+        self.wav_file.setframerate(self.rate)
+        # Overlap buffer to prevent missing audio at commit boundaries
+        overlap_chunks = compute_overlap_chunks(self.rate, self.chunk_size, overlap_seconds=5)
+        self.overlap_buffer = collections.deque(maxlen=overlap_chunks)
 
-    async def start_streaming(self):
-        loop = asyncio.get_running_loop()
+    async def start(self):
+        loop = asyncio.get_event_loop()
         self.running = True
 
         def callback(in_data, frame_count, time_info, status):
             if self.running:
-                encoded = base64.b64encode(in_data).decode("utf-8")
+                # store chunk for overlap
+                self.overlap_buffer.append(in_data)
+                # send audio to the API
+                b64 = base64.b64encode(in_data).decode("utf-8")
                 asyncio.run_coroutine_threadsafe(
-                    self.send_chunk(encoded), loop
+                    self.ws.send(json.dumps({
+                        "type": "input_audio_buffer.append",
+                        "audio": b64
+                    })), loop
                 )
+                # write raw PCM data to wave file
+                self.wav_file.writeframes(in_data)
             return (None, pyaudio.paContinue)
 
         self.stream = self.p.open(
             format=self.format,
-            channels=self.channels,
+            channels=1,
             rate=self.rate,
             input=True,
             frames_per_buffer=self.chunk_size,
             stream_callback=callback
         )
         self.stream.start_stream()
-
-    async def send_chunk(self, encoded_audio):
-        audio_event = {
-            "type": "input_audio_buffer.append",
-            "audio": encoded_audio
-        }
-        try:
-            await self.ws.send(json.dumps(audio_event))
-        except Exception as e:
-            logger.error(f"Error sending mic chunk: {e}")
-            self.running = False
+        logger.info("Mic streaming started.")
+        # keep the coroutine alive while streaming
+        while self.running:
+            await asyncio.sleep(0.1)
 
     def stop(self):
         self.running = False
@@ -168,24 +173,25 @@ class MicrophoneStreamer:
             self.stream.stop_stream()
             self.stream.close()
         self.p.terminate()
-
+        # close wave file
+        self.wav_file.close()
+        logger.info("Mic streaming stopped.")
 
 async def test_transcription():
     try:
-        # Step 1: Create transcription session and get ephemeral token.
-        ephemeral_token = await create_transcription_session()
+        token = await create_transcription_session()
 
-        # Step 2: Connect to the base realtime endpoint.
-        websocket_url = "wss://api.openai.com/v1/realtime"
-        connection_headers = {
-            "Authorization": f"Bearer {ephemeral_token}",
-            "OpenAI-Beta": "realtime=v1"
-        }
-        async with websockets.connect(websocket_url, extra_headers=connection_headers) as ws:
-            logger.info("Connected to realtime endpoint.")
+        async with websockets.connect(
+            "wss://api.openai.com/v1/realtime",
+            extra_headers={
+                "Authorization": f"Bearer {token}",
+                "OpenAI-Beta": "realtime=v1"
+            }
+        ) as ws:
+            logger.info("WebSocket opened.")
 
-            # Step 3: Send transcription session update event with adjusted VAD settings.
-            update_event = {
+            # disable server VAD on the live connection too
+            await ws.send(json.dumps({
                 "type": "transcription_session.update",
                 "session": {
                     "input_audio_transcription": {
@@ -193,33 +199,48 @@ async def test_transcription():
                         "language": "en",
                         "prompt": "Transcribe the incoming audio in real time."
                     },
-                    # Matching the REST API settings
-                    "turn_detection": {"type": "server_vad", "silence_duration_ms": 1000}
+                    "turn_detection": None
                 }
-            }
-            await ws.send(json.dumps(update_event))
-            logger.info("Sent transcription session update event.")
+            }))
+            logger.info("Sent session.update (VAD off).")
 
-            # Create an event to signal if speech stopped is detected.
-            speech_stopped_event = asyncio.Event()
+            # open local transcript file
+            transcript_file = open("transcript.txt", "w", encoding="utf-8")
 
-            # Step 4: Run sender and receiver concurrently.
-            mic_streamer = MicrophoneStreamer(ws)
+            # events to manage flow
+            commit_event = asyncio.Event()
+            final_event = asyncio.Event()
 
-            sender_task = asyncio.create_task(mic_streamer.start_streaming())
-            receiver_task = asyncio.create_task(receive_events(ws, speech_stopped_event))
+            # start microphone streamer
+            mic = MicrophoneStreamer(ws)
+            mic_task = asyncio.create_task(mic.start())
+            # start periodic commits every 5 seconds, resending overlap
+            commit_loop_task = asyncio.create_task(auto_commit(ws, mic, interval=5.0, commit_event=commit_event))
+            # start listening for API events
+            recv_task = asyncio.create_task(receive_events(ws, transcript_file, commit_event, final_event))
+            # wait for user to press Enter to stop
+            enter_task = asyncio.create_task(wait_for_enter_and_commit(ws, mic, commit_event))
 
-            await asyncio.gather(sender_task, receiver_task)
-            #await asyncio.gather(receiver_task)
-            mic_streamer.stop()
+            # wait until user signals stop
+            await commit_event.wait()
+            # wait until final transcription arrives
+            await final_event.wait()
 
-            # Print the final transcription.
-            logger.info("Final complete transcription: %s", final_transcription)
-            print("Final complete transcription:")
+            # cleanup tasks
+            commit_loop_task.cancel()
+            for t in (mic_task, recv_task, enter_task):
+                t.cancel()
+            # slight pause for final logs
+            await asyncio.sleep(0.1)
+            # close transcript file
+            transcript_file.close()
+
+            # output final transcription
+            print("\n=== Final transcription ===")
             print(final_transcription)
 
     except Exception as e:
-        logger.error("Error in transcription test: %s", e)
+        logger.error("Fatal error in transcription: %s", e)
 
 if __name__ == "__main__":
     asyncio.run(test_transcription())
