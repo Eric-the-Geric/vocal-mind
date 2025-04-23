@@ -2,12 +2,16 @@ import os
 import json
 import base64
 import asyncio
-import logging
 import aiohttp
 import websockets
 import pyaudio
 import wave
 import collections
+import logging
+from src import CleanupAgent
+from openai import OpenAI
+client = OpenAI()
+
 
 # Get API key
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -21,16 +25,80 @@ logger = logging.getLogger(__name__)
 # Global to hold the most recent transcription segment
 final_transcription = ""
 
-def compute_overlap_chunks(rate, chunk_size, overlap_seconds=20):
+OVERLAP_SECONDS = 5  # seconds of overlap to keep in the buffer
+INTERVAL = 10  # seconds between commits
+def compute_overlap_chunks(rate, chunk_size, overlap_seconds=5):
     # Calculate how many chunks correspond to the overlap duration
     return int(rate * overlap_seconds / chunk_size) + 1
 
+class MicrophoneStreamer:
+    def __init__(self, ws, chunk_size=1024, rate=16000, fmt=pyaudio.paInt16, wav_filename="outputs/output.wav"):
+        self.ws = ws
+        self.chunk_size = chunk_size
+        self.rate = rate
+        self.format = fmt
+        self.p = pyaudio.PyAudio()
+        self.stream = None
+        self.running = False
+        # Set up wave file for local recording
+        self.wav_file = wave.open(wav_filename, "wb")
+        self.wav_file.setnchannels(1)
+        self.wav_file.setsampwidth(self.p.get_sample_size(self.format))
+        self.wav_file.setframerate(self.rate)
+        # Overlap buffer to prevent missing audio at commit boundaries
+        overlap_chunks = compute_overlap_chunks(self.rate, self.chunk_size, overlap_seconds=OVERLAP_SECONDS)
+        self.overlap_buffer = collections.deque(maxlen=overlap_chunks)
+        self.logger = logger
+
+    async def start(self):
+        loop = asyncio.get_event_loop()
+        self.running = True
+
+        def callback(in_data, frame_count, time_info, status):
+            if self.running:
+                # store chunk for overlap
+                self.overlap_buffer.append(in_data)
+                # send audio to the API
+                b64 = base64.b64encode(in_data).decode("utf-8")
+                asyncio.run_coroutine_threadsafe(
+                    self.ws.send(json.dumps({
+                        "type": "input_audio_buffer.append",
+                        "audio": b64
+                    })), loop
+                )
+                # write raw PCM data to wave file
+                self.wav_file.writeframes(in_data)
+            return (None, pyaudio.paContinue)
+
+        self.stream = self.p.open(
+            format=self.format,
+            channels=1,
+            rate=self.rate,
+            input=True,
+            frames_per_buffer=self.chunk_size,
+            stream_callback=callback
+        )
+        self.stream.start_stream()
+        logger.info("Mic streaming started.")
+        # keep the coroutine alive while streaming
+        while self.running:
+            await asyncio.sleep(0.1)
+
+    def stop(self):
+        self.running = False
+        if self.stream:
+            self.stream.stop_stream()
+            self.stream.close()
+        self.p.terminate()
+        # close wave file
+        self.wav_file.close()
+        logger.info("Mic streaming stopped.")
 async def create_transcription_session():
     url = "https://api.openai.com/v1/realtime/transcription_sessions"
     payload = {
         "input_audio_format": "pcm16",
         "input_audio_transcription": {
-            "model": "gpt-4o-transcribe",
+            "model": "gpt-4o-mini-transcribe",
             "language": "en",
             "prompt": "Transcribe the incoming audio. Do not summarize or translate. Include words like 'uh', 'um', and 'ah'. Be as accurate as possible.",
         },
@@ -115,69 +183,8 @@ async def receive_events(ws, transcript_file, commit_event: asyncio.Event, final
         # ensure we unblock the main flow
         final_event.set()
 
-class MicrophoneStreamer:
-    def __init__(self, ws, chunk_size=1024, rate=16000, fmt=pyaudio.paInt16, wav_filename="output.wav"):
-        self.ws = ws
-        self.chunk_size = chunk_size
-        self.rate = rate
-        self.format = fmt
-        self.p = pyaudio.PyAudio()
-        self.stream = None
-        self.running = False
-        # Set up wave file for local recording
-        self.wav_file = wave.open(wav_filename, "wb")
-        self.wav_file.setnchannels(1)
-        self.wav_file.setsampwidth(self.p.get_sample_size(self.format))
-        self.wav_file.setframerate(self.rate)
-        # Overlap buffer to prevent missing audio at commit boundaries
-        overlap_chunks = compute_overlap_chunks(self.rate, self.chunk_size, overlap_seconds=5)
-        self.overlap_buffer = collections.deque(maxlen=overlap_chunks)
 
-    async def start(self):
-        loop = asyncio.get_event_loop()
-        self.running = True
-
-        def callback(in_data, frame_count, time_info, status):
-            if self.running:
-                # store chunk for overlap
-                self.overlap_buffer.append(in_data)
-                # send audio to the API
-                b64 = base64.b64encode(in_data).decode("utf-8")
-                asyncio.run_coroutine_threadsafe(
-                    self.ws.send(json.dumps({
-                        "type": "input_audio_buffer.append",
-                        "audio": b64
-                    })), loop
-                )
-                # write raw PCM data to wave file
-                self.wav_file.writeframes(in_data)
-            return (None, pyaudio.paContinue)
-
-        self.stream = self.p.open(
-            format=self.format,
-            channels=1,
-            rate=self.rate,
-            input=True,
-            frames_per_buffer=self.chunk_size,
-            stream_callback=callback
-        )
-        self.stream.start_stream()
-        logger.info("Mic streaming started.")
-        # keep the coroutine alive while streaming
-        while self.running:
-            await asyncio.sleep(0.1)
-
-    def stop(self):
-        self.running = False
-        if self.stream:
-            self.stream.stop_stream()
-            self.stream.close()
-        self.p.terminate()
-        # close wave file
-        self.wav_file.close()
-        logger.info("Mic streaming stopped.")
-
-async def test_transcription():
+async def main():
     try:
         token = await create_transcription_session()
 
@@ -205,7 +212,7 @@ async def test_transcription():
             logger.info("Sent session.update (VAD off).")
 
             # open local transcript file
-            transcript_file = open("transcript.txt", "w", encoding="utf-8")
+            transcript_file = open("./outputs/transcript.txt", "w", encoding="utf-8")
 
             # events to manage flow
             commit_event = asyncio.Event()
@@ -215,7 +222,7 @@ async def test_transcription():
             mic = MicrophoneStreamer(ws)
             mic_task = asyncio.create_task(mic.start())
             # start periodic commits every 5 seconds, resending overlap
-            commit_loop_task = asyncio.create_task(auto_commit(ws, mic, interval=5.0, commit_event=commit_event))
+            commit_loop_task = asyncio.create_task(auto_commit(ws, mic, interval=INTERVAL, commit_event=commit_event))
             # start listening for API events
             recv_task = asyncio.create_task(receive_events(ws, transcript_file, commit_event, final_event))
             # wait for user to press Enter to stop
@@ -243,4 +250,10 @@ async def test_transcription():
         logger.error("Fatal error in transcription: %s", e)
 
 if __name__ == "__main__":
-    asyncio.run(test_transcription())
+    asyncio.run(main())
+    client = OpenAI()
+    # Cleanup agent
+    cleanup_agent = CleanupAgent(client, "./outputs/transcript.txt")
+    new_transcript = cleanup_agent.run()
+    print(new_transcript)
+
