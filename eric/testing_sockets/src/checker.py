@@ -1,4 +1,5 @@
 
+
 class CleanupAgent:
     def __init__(self, client, model="gpt-4.1-mini", transcript_path="./outputs/transcript.txt"):
         self.client = client
@@ -51,4 +52,4 @@ class CleanupAgent:
         )
         # Example cleanup operation
 
-        return response
+        return response.choices[0].message.content

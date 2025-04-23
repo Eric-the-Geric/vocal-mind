@@ -249,6 +249,23 @@ async def main():
     except Exception as e:
         logger.error("Fatal error in transcription: %s", e)
 
+def text_to_speech_openai(client, text, output_path):
+    """Convert text to speech using OpenAI's TTS API"""
+    try:
+        
+        response = client.audio.speech.create(
+            model="tts-1",  # or tts-1-hd for higher quality
+            voice="alloy",  # options: alloy, echo, fable, onyx, nova, shimmer
+            input=text
+        )
+        
+        response.stream_to_file(output_path)
+        print(f"Speech saved to {output_path}")
+        return True
+    except Exception as e:
+        print(f"Error generating speech: {e}")
+        return False
+
 if __name__ == "__main__":
     asyncio.run(main())
     client = OpenAI()
@@ -256,4 +273,9 @@ if __name__ == "__main__":
     cleanup_agent = CleanupAgent(client, "./outputs/transcript.txt")
     new_transcript = cleanup_agent.run()
     print(new_transcript)
+    # Convert text to speech
+    output_path = "./outputs/speech.wav"
+    text = new_transcript
+    text_to_speech_openai(client, text, output_path)
+
 
