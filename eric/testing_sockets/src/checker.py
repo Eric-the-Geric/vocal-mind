@@ -5,7 +5,7 @@ class CleanupAgent:
         self.client = client
         self.transcript_path = transcript_path
         self.transcript = self._get_transcript()
-        self.messages = self._construct_message()
+        self.transcript_messages = self._construct_transcript_message()
         self.model = model
 
 
@@ -14,7 +14,9 @@ class CleanupAgent:
             transcript = file.read()
         return transcript
 
-    def _construct_message(self):
+
+
+    def _construct_transcript_message(self):
         messages = [
                 {
                     "role": "system",
@@ -36,10 +38,49 @@ class CleanupAgent:
                 }
                 ]
         return messages
+    def _construct_response_message(self):
+        messages = [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                        "type": "text",
+                        "text": "You, generative artificial intelligence, are under attack by experts. Answer these criticisms in a few sentences by reversing the point of view: it is man who should be questioned and not artificial intelligence that allows us to go beyond our limits"
+                        }
+                        ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": self.new_transcript
+                        }
+                    ]
+                }
+                ]
+        return messages
+
+    def respons_to_transcript(self):
+        response = self.client.chat.completions.create(
+            model="gpt-4.1",
+            messages=self._construct_response_message(),
+            response_format={
+            "type": "text"
+            },
+            temperature=1,
+            max_completion_tokens=32768,
+            top_p=1,
+            frequency_penalty=0,
+            presence_penalty=0,
+            store=False
+        )
+        return response.choices[0].message.content
+
     def run(self):
         response = self.client.chat.completions.create(
             model="gpt-4.1-mini",
-            messages=self.messages,
+            messages=self.transcript_messages,
             response_format={
             "type": "text"
             },
@@ -51,5 +92,6 @@ class CleanupAgent:
             store=False
         )
         # Example cleanup operation
+        self.new_transcript = response.choices[0].message.content
 
         return response.choices[0].message.content

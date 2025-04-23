@@ -253,13 +253,14 @@ def text_to_speech_openai(client, text, output_path):
     """Convert text to speech using OpenAI's TTS API"""
     try:
         
-        response = client.audio.speech.create(
-            model="tts-1",  # or tts-1-hd for higher quality
+        with client.audio.speech.with_streaming_response.create(
+            model="gpt-4o-mini-tts",  # or tts-1-hd for higher quality
             voice="alloy",  # options: alloy, echo, fable, onyx, nova, shimmer
-            input=text
-        )
+            input=text,
+            instructions="Speak in a mennacing tone and use a deep french accent.", 
+            ) as response:
         
-        response.stream_to_file(output_path)
+            response.stream_to_file(output_path)
         print(f"Speech saved to {output_path}")
         return True
     except Exception as e:
@@ -267,15 +268,15 @@ def text_to_speech_openai(client, text, output_path):
         return False
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    #asyncio.run(main())
     client = OpenAI()
     # Cleanup agent
     cleanup_agent = CleanupAgent(client, "./outputs/transcript.txt")
-    new_transcript = cleanup_agent.run()
-    print(new_transcript)
+    cleanup_agent.run()
+    response = cleanup_agent.respons_to_transcript()
     # Convert text to speech
     output_path = "./outputs/speech.wav"
-    text = new_transcript
+    text = response
     text_to_speech_openai(client, text, output_path)
 
 
