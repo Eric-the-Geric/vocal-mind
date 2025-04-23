@@ -268,7 +268,7 @@ def text_to_speech_openai(client, text, output_path):
         return False
 
 if __name__ == "__main__":
-    #asyncio.run(main())
+    asyncio.run(main())
     client = OpenAI()
     # Cleanup agent
     cleanup_agent = CleanupAgent(client, "./outputs/transcript.txt")
