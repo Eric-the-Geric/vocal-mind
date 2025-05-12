@@ -10,7 +10,8 @@ import collections
 import logging
 from src import CleanupAgent
 from openai import OpenAI
-client = OpenAI()
+import time
+#client = OpenAI()
 
 
 # Get API key
@@ -190,7 +191,7 @@ async def main():
 
         async with websockets.connect(
             "wss://api.openai.com/v1/realtime",
-            extra_headers={
+            additional_headers={
                 "Authorization": f"Bearer {token}",
                 "OpenAI-Beta": "realtime=v1"
             }
@@ -252,12 +253,11 @@ async def main():
 def text_to_speech_openai(client, text, output_path):
     """Convert text to speech using OpenAI's TTS API"""
     try:
-        
         with client.audio.speech.with_streaming_response.create(
             model="gpt-4o-mini-tts",  # or tts-1-hd for higher quality
             voice="alloy",  # options: alloy, echo, fable, onyx, nova, shimmer
             input=text,
-            instructions="Speak in a mennacing tone and use a deep french accent.", 
+            instructions="Speak in a natural tone with authority", 
             ) as response:
         
             response.stream_to_file(output_path)
@@ -271,12 +271,21 @@ if __name__ == "__main__":
     asyncio.run(main())
     client = OpenAI()
     # Cleanup agent
-    cleanup_agent = CleanupAgent(client, "./outputs/transcript.txt")
+    start = time.time()
+    cleanup_agent = CleanupAgent(client, "./outputs/Alex.txt")
     cleanup_agent.run()
-    response = cleanup_agent.respons_to_transcript()
+    end = time.time()
+    print("time to clean up: ", end-start)
+    start = time.time()
+    response = cleanup_agent.respond_to_transcript()
+    end = time.time()
+    print("time to respond: ", end-start)
     # Convert text to speech
-    output_path = "./outputs/speech.wav"
+    output_path = "./outputs/response_test.wav"
     text = response
+    start = time.time()
     text_to_speech_openai(client, text, output_path)
+    end = time.time()
+    print("text to speech part", end-start)
 
 
