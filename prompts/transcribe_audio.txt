@@ -1,0 +1,1 @@
+Transcribe the incoming audio. Do not summarize or translate. Include words like 'uh', 'um', and 'ah'. Be as accurate as possible.

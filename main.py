@@ -11,8 +11,6 @@ import logging
 from src import CleanupAgent
 from openai import OpenAI
 import time
-#client = OpenAI()
-
 
 # Get API key
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -95,13 +93,18 @@ class MicrophoneStreamer:
         self.wav_file.close()
         logger.info("Mic streaming stopped.")
 async def create_transcription_session():
+    with open("./prompts/transcribe_audio.txt", "r") as f:
+        prmpt = f.read()
+
     url = "https://api.openai.com/v1/realtime/transcription_sessions"
     payload = {
         "input_audio_format": "pcm16",
         "input_audio_transcription": {
             "model": "gpt-4o-mini-transcribe",
-            "language": "en",
-            "prompt": "Transcribe the incoming audio. Do not summarize or translate. Include words like 'uh', 'um', and 'ah'. Be as accurate as possible.",
+            #"language": "en",
+            "language": "fr",
+            #"prompt": "Transcribe the incoming audio. Do not summarize or translate. Include words like 'uh', 'um', and 'ah'. Be as accurate as possible.",
+            "prompt": prmpt,
         },
         "turn_detection": None  # disable server VAD
     }
@@ -185,7 +188,9 @@ async def receive_events(ws, transcript_file, commit_event: asyncio.Event, final
         final_event.set()
 
 
-async def main():
+async def main(t):
+    with open("./prompts/transcribe_audio.txt", "r") as f:
+        prmpt = f.read()
     try:
         token = await create_transcription_session()
 
@@ -205,7 +210,8 @@ async def main():
                     "input_audio_transcription": {
                         "model": "gpt-4o-transcribe",
                         "language": "en",
-                        "prompt": "Transcribe the incoming audio in real time."
+                        #"prompt": "Transcribe the incoming audio in real time."
+                        "prompt": prmpt
                     },
                     "turn_detection": None
                 }
@@ -213,7 +219,9 @@ async def main():
             logger.info("Sent session.update (VAD off).")
 
             # open local transcript file
-            transcript_file = open("./outputs/transcript.txt", "w", encoding="utf-8")
+            transcript_path = "./outputs/transcript_" +str(t) + ".txt"
+            #transcript_file = open("./outputs/transcript.txt", "w", encoding="utf-8")
+            transcript_file = open(transcript_path, "w", encoding="utf-8")
 
             # events to manage flow
             commit_event = asyncio.Event()
@@ -252,12 +260,15 @@ async def main():
 
 def text_to_speech_openai(client, text, output_path):
     """Convert text to speech using OpenAI's TTS API"""
+    with open("./prompts/tts_instructions.txt", "r") as f:
+        instruction = f.read()
     try:
         with client.audio.speech.with_streaming_response.create(
             model="gpt-4o-mini-tts",  # or tts-1-hd for higher quality
             voice="alloy",  # options: alloy, echo, fable, onyx, nova, shimmer
             input=text,
-            instructions="Speak in a natural tone with authority", 
+            #instructions="Speak in a natural tone with authority", 
+            instructions=instruction, 
             ) as response:
         
             response.stream_to_file(output_path)
@@ -268,11 +279,18 @@ def text_to_speech_openai(client, text, output_path):
         return False
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    t = time.time()
+    t = int(t)
+    asyncio.run(main(t))
     client = OpenAI()
     # Cleanup agent
     start = time.time()
-    cleanup_agent = CleanupAgent(client, "./outputs/transcript.txt")
+    transcript_path = "./outputs/transcript_"+str(t) + ".txt"
+    cleanup_agent = CleanupAgent(client,
+                                 transcript_path=transcript_path,
+                                 cleanup_prompt_path="./prompts/cleanup_prompt.txt",
+                                 response_prompt_path="./prompts/response_prompt.txt",
+                                 )
     cleanup_agent.run()
     end = time.time()
     print("time to clean up: ", end-start)
@@ -281,7 +299,7 @@ if __name__ == "__main__":
     end = time.time()
     print("time to respond: ", end-start)
     # Convert text to speech
-    output_path = "./outputs/response_test.wav"
+    output_path = "./outputs/response_test_"+ str(t) + ".wav"
     text = response
     start = time.time()
     text_to_speech_openai(client, text, output_path)
