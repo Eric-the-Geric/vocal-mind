@@ -228,7 +228,7 @@ async def main(t):
             final_event = asyncio.Event()
 
             # start microphone streamer
-            mic = MicrophoneStreamer(ws)
+            mic = MicrophoneStreamer(ws, wav_filename=f"./outputs/microphone_recording_{str(t)}.wav")
             mic_task = asyncio.create_task(mic.start())
             # start periodic commits every 5 seconds, resending overlap
             commit_loop_task = asyncio.create_task(auto_commit(ws, mic, interval=INTERVAL, commit_event=commit_event))

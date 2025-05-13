@@ -110,5 +110,10 @@ class CleanupAgent:
         )
         # Example cleanup operation
         self.new_transcript = response.choices[0].message.content
+        self.new_transcript_path = self.transcript_path.split("/")
+        self.new_transcript_path[-1] = "new_"+ self.new_transcript_path [-1]
+        self.new_transcript_path = "/".join(self.new_transcript_path )
+        with open(self.new_transcript_path, "w") as f:
+            f.write(self.new_transcript)
 
         return response.choices[0].message.content
