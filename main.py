@@ -303,6 +303,8 @@ if __name__ == "__main__":
     text = response
     start = time.time()
     text_to_speech_openai(client, text, output_path)
+    import subprocess
+    subprocess.run(['open', output_path])
     end = time.time()
     print("text to speech part", end-start)
 
