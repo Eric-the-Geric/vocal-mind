@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+
+python main.py \
+	--cleanup ./prompts/cleanup_prompt_eng.txt \
+	--response ./prompts/response_prompt_eng.txt \
+	--tts ./prompts/tts_instructions.txt

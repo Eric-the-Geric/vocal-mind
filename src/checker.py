@@ -1,3 +1,31 @@
+import re
+
+def sentence_stream(generator):
+    """
+    Turn a token-stream generator into full sentences.
+    Yields each sentence as soon as it’s complete.
+    """
+    buffer = ""
+    # split after ., ? or ! followed by whitespace
+    splitter = re.compile(r'(?<=[\.\?\!])\s+')
+    for chunk in generator:
+        # pull out the new text (or skip if there's none)
+        content = getattr(chunk.choices[0].delta, "content", None)
+        if not content:
+            continue
+
+        buffer += content
+        parts = splitter.split(buffer)
+        # everything but the last part is a complete sentence
+        for sent in parts[:-1]:
+            yield sent.strip()
+        # the last part is (so far) incomplete
+        buffer = parts[-1]
+
+    # at the very end, whatever’s left is one last sentence
+    if buffer.strip():
+        yield buffer.strip()
+
 
 
 class CleanupAgent:
@@ -71,7 +99,8 @@ class CleanupAgent:
                     "content": [
                         {
                             "type": "text",
-                            "text": self.new_transcript
+                            #"text": self.new_transcript
+                            "text": self.transcript
                         }
                     ]
                 }
@@ -94,9 +123,28 @@ class CleanupAgent:
         )
         return response.choices[0].message.content
 
+    def stream_response(self, on_sentence_callback):
+        stream = self.client.chat.completions.create(
+            model="gpt-4.1",
+            messages=self._construct_response_message(),
+            stream=True,
+            response_format={
+            "type": "text"
+            },
+            temperature=1,
+            max_completion_tokens=32768,
+            top_p=1,
+            frequency_penalty=0,
+            presence_penalty=0,
+            store=False
+                )
+        for sentence in sentence_stream(stream):
+            on_sentence_callback(sentence)
+
     def run(self):
         response = self.client.chat.completions.create(
             model="gpt-4.1-mini",
+            #model="gpt-4.1-nano",
             messages=self.transcript_messages,
             response_format={
             "type": "text"
@@ -111,7 +159,7 @@ class CleanupAgent:
         # Example cleanup operation
         self.new_transcript = response.choices[0].message.content
         self.new_transcript_path = self.transcript_path.split("/")
-        self.new_transcript_path[-1] = "new_"+ self.new_transcript_path [-1]
+        self.new_transcript_path[-1] = "new_"+ self.new_transcript_path[-1]
         self.new_transcript_path = "/".join(self.new_transcript_path )
         with open(self.new_transcript_path, "w") as f:
             f.write(self.new_transcript)

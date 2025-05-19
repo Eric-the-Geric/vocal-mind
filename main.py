@@ -14,7 +14,7 @@ import time
 from openai import AsyncOpenAI
 from openai.helpers import LocalAudioPlayer
 import numpy as np
-
+import argparse
 a_openai = AsyncOpenAI()
 
 # Get API key
@@ -291,39 +291,60 @@ async def tts(tts_instructions, input_prompt, voice_model) -> None:
         instructions=tts_instructions,
         response_format="wav",
     ) as response:
+        gen_end = time.time()
         await LocalAudioPlayer().play(response)
+    end=time.time()
+    print(f"Generation: {gen_end - start:.2f}s, Playback: {end - gen_end:.2f}s")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--cleanup', type=str, default='./prompts/cleanup_prompt.txt')
+    parser.add_argument('--response', type=str, default='./prompts/response_prompt.txt')
+    parser.add_argument('--tts', type=str, default='./prompts/tts_instructions.txt')
+    args = parser.parse_args()
     t = time.time()
     t = int(t)
-    #asyncio.run(main(t))
+    asyncio.run(main(t))
     client = OpenAI()
     # Cleanup agent
     start = time.time()
     #transcript_path = "./outputs/transcript_"+str(t) + ".txt"
-    transcript_path = "./outputs/transcript_1747219726.txt"
+    transcript_path = "./outputs/Alex.txt"
     cleanup_agent = CleanupAgent(client,
                                  transcript_path=transcript_path,
-                                 cleanup_prompt_path="./prompts/cleanup_prompt.txt",
-                                 response_prompt_path="./prompts/response_prompt.txt",
+                                 #cleanup_prompt_path="./prompts/cleanup_prompt.txt",
+                                 cleanup_prompt_path=args.cleanup,
+                                 #response_prompt_path="./prompts/response_prompt.txt",
+                                 response_prompt_path=args.response,
                                  )
-    cleanup_agent.run()
+    #cleanup_agent.run()
     end = time.time()
+    print('#'*10)
     print("time to clean up: ", end-start)
-    start = time.time()
-    response = cleanup_agent.respond_to_transcript()
-    end = time.time()
-    print("time to respond: ", end-start)
+    print('#'*10)
+    #start = time.time()
+    #response = cleanup_agent.respond_to_transcript()
+    #end = time.time()
+    print('#'*10)
+    print("time to responde: ", end-start)
+    print('#'*10)
     # Convert text to speech
     output_path = "./outputs/response_test_"+ str(t) + ".wav"
-    text = response
+    #text = response
     start = time.time()
     voice_model = np.random.choice(["echo", "alloy", "onyx"])
-    with open("./prompts/tts_instructions.txt", "r") as f:
+    #with open("./prompts/tts_instructions.txt", "r") as f:
+    with open(args.tts, "r") as f:
         instruction = f.read()
-    asyncio.run(tts(instruction, text, voice_model))
+
+    def speak(sentence: str):
+        asyncio.run(tts(instruction, sentence, voice_model))
+    cleanup_agent.stream_response(speak)
+    #asyncio.run(tts(instruction, text, voice_model))
     #text_to_speech_openai(client, text, output_path)
-    import subprocess
-    subprocess.run(['open', output_path])
     end = time.time()
+    print('#'*10)
     print("text to speech part", end-start)
+    print('#'*10)
+    #import subprocess
+    #subprocess.run(['open', output_path])
