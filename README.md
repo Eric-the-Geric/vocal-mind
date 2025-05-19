@@ -50,3 +50,10 @@ Prerequisites:
    ```bash
    python eric/testing_sockets/main.py
    ```
+
+#TODO
+Explore the openai AgentSDK, as it might be a faster pipeline to do the text-to-speech.
+This will also allow me to explore the sdk more and potentially use it more of my applications
+
+
+
