@@ -11,6 +11,11 @@ import logging
 from src import CleanupAgent
 from openai import OpenAI
 import time
+from openai import AsyncOpenAI
+from openai.helpers import LocalAudioPlayer
+import numpy as np
+
+a_openai = AsyncOpenAI()
 
 # Get API key
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -265,7 +270,7 @@ def text_to_speech_openai(client, text, output_path):
     try:
         with client.audio.speech.with_streaming_response.create(
             model="gpt-4o-mini-tts",  # or tts-1-hd for higher quality
-            voice="alloy",  # options: alloy, echo, fable, onyx, nova, shimmer
+            voice="echo",  # options: alloy, echo, fable, onyx, nova, shimmer
             input=text,
             #instructions="Speak in a natural tone with authority", 
             instructions=instruction, 
@@ -278,14 +283,25 @@ def text_to_speech_openai(client, text, output_path):
         print(f"Error generating speech: {e}")
         return False
 
+async def tts(tts_instructions, input_prompt, voice_model) -> None:
+    async with a_openai.audio.speech.with_streaming_response.create(
+        model="gpt-4o-mini-tts",
+        voice=voice_model,
+        input=input_prompt,
+        instructions=tts_instructions,
+        response_format="wav",
+    ) as response:
+        await LocalAudioPlayer().play(response)
+
 if __name__ == "__main__":
     t = time.time()
     t = int(t)
-    asyncio.run(main(t))
+    #asyncio.run(main(t))
     client = OpenAI()
     # Cleanup agent
     start = time.time()
-    transcript_path = "./outputs/transcript_"+str(t) + ".txt"
+    #transcript_path = "./outputs/transcript_"+str(t) + ".txt"
+    transcript_path = "./outputs/transcript_1747219726.txt"
     cleanup_agent = CleanupAgent(client,
                                  transcript_path=transcript_path,
                                  cleanup_prompt_path="./prompts/cleanup_prompt.txt",
@@ -302,10 +318,12 @@ if __name__ == "__main__":
     output_path = "./outputs/response_test_"+ str(t) + ".wav"
     text = response
     start = time.time()
-    text_to_speech_openai(client, text, output_path)
+    voice_model = np.random.choice(["echo", "alloy", "onyx"])
+    with open("./prompts/tts_instructions.txt", "r") as f:
+        instruction = f.read()
+    asyncio.run(tts(instruction, text, voice_model))
+    #text_to_speech_openai(client, text, output_path)
     import subprocess
     subprocess.run(['open', output_path])
     end = time.time()
     print("text to speech part", end-start)
-
-
