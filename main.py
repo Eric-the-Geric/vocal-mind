@@ -1,4 +1,5 @@
 import os
+import io
 import json
 import base64
 import asyncio
@@ -8,13 +9,16 @@ import pyaudio
 import wave
 import collections
 import logging
-from src import CleanupAgent
-from openai import OpenAI
+from pathlib import Path
 import time
-from openai import AsyncOpenAI
-from openai.helpers import LocalAudioPlayer
 import numpy as np
 import argparse
+
+from src import CleanupAgent
+from openai import OpenAI, AsyncOpenAI
+from openai.helpers import LocalAudioPlayer
+
+# --- TTS client for async generation/playback ---
 a_openai = AsyncOpenAI()
 
 # Get API key
@@ -26,14 +30,14 @@ if not OPENAI_API_KEY:
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# Global to hold the most recent transcription segment
+# Global to hold transcription
 final_transcription = ""
 
-OVERLAP_SECONDS = 5  # seconds of overlap to keep in the buffer
-INTERVAL = 10  # seconds between commits
+OVERLAP_SECONDS = 5
+INTERVAL = 10
 def compute_overlap_chunks(rate, chunk_size, overlap_seconds=5):
-    # Calculate how many chunks correspond to the overlap duration
     return int(rate * overlap_seconds / chunk_size) + 1
+
 
 class MicrophoneStreamer:
     def __init__(self, ws, chunk_size=1024, rate=16000, fmt=pyaudio.paInt16, wav_filename="outputs/output.wav"):
@@ -44,12 +48,10 @@ class MicrophoneStreamer:
         self.p = pyaudio.PyAudio()
         self.stream = None
         self.running = False
-        # Set up wave file for local recording
         self.wav_file = wave.open(wav_filename, "wb")
         self.wav_file.setnchannels(1)
         self.wav_file.setsampwidth(self.p.get_sample_size(self.format))
         self.wav_file.setframerate(self.rate)
-        # Overlap buffer to prevent missing audio at commit boundaries
         overlap_chunks = compute_overlap_chunks(self.rate, self.chunk_size, overlap_seconds=OVERLAP_SECONDS)
         self.overlap_buffer = collections.deque(maxlen=overlap_chunks)
         self.logger = logger
@@ -60,9 +62,7 @@ class MicrophoneStreamer:
 
         def callback(in_data, frame_count, time_info, status):
             if self.running:
-                # store chunk for overlap
                 self.overlap_buffer.append(in_data)
-                # send audio to the API
                 b64 = base64.b64encode(in_data).decode("utf-8")
                 asyncio.run_coroutine_threadsafe(
                     self.ws.send(json.dumps({
@@ -70,21 +70,16 @@ class MicrophoneStreamer:
                         "audio": b64
                     })), loop
                 )
-                # write raw PCM data to wave file
                 self.wav_file.writeframes(in_data)
             return (None, pyaudio.paContinue)
 
         self.stream = self.p.open(
-            format=self.format,
-            channels=1,
-            rate=self.rate,
-            input=True,
-            frames_per_buffer=self.chunk_size,
+            format=self.format, channels=1, rate=self.rate,
+            input=True, frames_per_buffer=self.chunk_size,
             stream_callback=callback
         )
         self.stream.start_stream()
         logger.info("Mic streaming started.")
-        # keep the coroutine alive while streaming
         while self.running:
             await asyncio.sleep(0.1)
 
@@ -94,9 +89,10 @@ class MicrophoneStreamer:
             self.stream.stop_stream()
             self.stream.close()
         self.p.terminate()
-        # close wave file
         self.wav_file.close()
         logger.info("Mic streaming stopped.")
+
+
 async def create_transcription_session():
     with open("./prompts/transcribe_audio.txt", "r") as f:
         prmpt = f.read()
@@ -106,12 +102,10 @@ async def create_transcription_session():
         "input_audio_format": "pcm16",
         "input_audio_transcription": {
             "model": "gpt-4o-mini-transcribe",
-            #"language": "en",
             "language": "fr",
-            #"prompt": "Transcribe the incoming audio. Do not summarize or translate. Include words like 'uh', 'um', and 'ah'. Be as accurate as possible.",
             "prompt": prmpt,
         },
-        "turn_detection": None  # disable server VAD
+        "turn_detection": None
     }
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -124,40 +118,33 @@ async def create_transcription_session():
                 text = await resp.text()
                 raise Exception(f"Failed to create session: {resp.status} {text}")
             data = await resp.json()
-            token = data["client_secret"]["value"]
             logger.info("Got ephemeral token.")
-            return token
+            return data["client_secret"]["value"]
+
 
 async def auto_commit(ws, mic, interval: float, commit_event: asyncio.Event):
-    """
-    Periodically send commit events, resending the last audio overlap to avoid dropped words.
-    """
     while not commit_event.is_set():
         await asyncio.sleep(interval)
-        # resend the overlap buffer
-        for pcm_chunk in list(mic.overlap_buffer):
-            b64 = base64.b64encode(pcm_chunk).decode("utf-8")
+        for pcm in list(mic.overlap_buffer):
+            b64 = base64.b64encode(pcm).decode("utf-8")
             await ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": b64}))
-        # send commit
         await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-        logger.info("Sent periodic commit event with overlap.")
+        logger.info("Sent periodic commit with overlap.")
     logger.info("Auto-commit stopped.")
 
+
 async def wait_for_enter_and_commit(ws, mic, commit_event: asyncio.Event):
-    # run blocking input() in executor so it doesn't block the loop
     await asyncio.get_event_loop().run_in_executor(
         None, input, "Press Enter to stop recording and send final commit...\n"
     )
-    # before final commit, resend overlap one last time
-    for pcm_chunk in list(mic.overlap_buffer):
-        b64 = base64.b64encode(pcm_chunk).decode("utf-8")
+    for pcm in list(mic.overlap_buffer):
+        b64 = base64.b64encode(pcm).decode("utf-8")
         await ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": b64}))
     await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-    logger.info("Sent manual commit event with overlap.")
-    # stop the mic
+    logger.info("Sent manual commit with overlap.")
     mic.stop()
-    # signal that final commit was requested
     commit_event.set()
+
 
 async def receive_events(ws, transcript_file, commit_event: asyncio.Event, final_event: asyncio.Event):
     global final_transcription
@@ -172,14 +159,11 @@ async def receive_events(ws, transcript_file, commit_event: asyncio.Event, final
             elif t == "conversation.item.input_audio_transcription.completed":
                 text = event.get("transcript", "")
                 logger.info("✅ Completed segment: %s", text)
-                # write this segment to the transcript file
                 transcript_file.write(text + "\n")
                 transcript_file.flush()
                 if not commit_event.is_set():
-                    # a periodic (partial) segment, reset buffer for the next segment
                     final_transcription = ""
                 else:
-                    # final segment, signal and exit
                     final_transcription = text
                     final_event.set()
                     break
@@ -189,7 +173,6 @@ async def receive_events(ws, transcript_file, commit_event: asyncio.Event, final
                 logger.debug("Event: %s", t)
     except Exception as e:
         logger.error("receive_events error: %s", e)
-        # ensure we unblock the main flow
         final_event.set()
 
 
@@ -207,15 +190,12 @@ async def main(t):
             }
         ) as ws:
             logger.info("WebSocket opened.")
-
-            # disable server VAD on the live connection too
             await ws.send(json.dumps({
                 "type": "transcription_session.update",
                 "session": {
                     "input_audio_transcription": {
                         "model": "gpt-4o-transcribe",
                         "language": "en",
-                        #"prompt": "Transcribe the incoming audio in real time."
                         "prompt": prmpt
                     },
                     "turn_detection": None
@@ -223,128 +203,157 @@ async def main(t):
             }))
             logger.info("Sent session.update (VAD off).")
 
-            # open local transcript file
-            transcript_path = "./outputs/transcript_" +str(t) + ".txt"
-            #transcript_file = open("./outputs/transcript.txt", "w", encoding="utf-8")
+            transcript_path = f"./outputs/transcript_{t}.txt"
             transcript_file = open(transcript_path, "w", encoding="utf-8")
 
-            # events to manage flow
             commit_event = asyncio.Event()
             final_event = asyncio.Event()
 
-            # start microphone streamer
-            mic = MicrophoneStreamer(ws, wav_filename=f"./outputs/microphone_recording_{str(t)}.wav")
+            mic = MicrophoneStreamer(ws,
+                                     wav_filename=f"./outputs/microphone_recording_{t}.wav")
             mic_task = asyncio.create_task(mic.start())
-            # start periodic commits every 5 seconds, resending overlap
-            commit_loop_task = asyncio.create_task(auto_commit(ws, mic, interval=INTERVAL, commit_event=commit_event))
-            # start listening for API events
+            commit_loop_task = asyncio.create_task(auto_commit(ws, mic, INTERVAL, commit_event))
             recv_task = asyncio.create_task(receive_events(ws, transcript_file, commit_event, final_event))
-            # wait for user to press Enter to stop
             enter_task = asyncio.create_task(wait_for_enter_and_commit(ws, mic, commit_event))
 
-            # wait until user signals stop
             await commit_event.wait()
-            # wait until final transcription arrives
             await final_event.wait()
 
-            # cleanup tasks
             commit_loop_task.cancel()
-            for t in (mic_task, recv_task, enter_task):
-                t.cancel()
-            # slight pause for final logs
+            for task in (mic_task, recv_task, enter_task):
+                task.cancel()
             await asyncio.sleep(0.1)
-            # close transcript file
             transcript_file.close()
 
-            # output final transcription
             print("\n=== Final transcription ===")
             print(final_transcription)
 
     except Exception as e:
         logger.error("Fatal error in transcription: %s", e)
 
-def text_to_speech_openai(client, text, output_path):
-    """Convert text to speech using OpenAI's TTS API"""
-    with open("./prompts/tts_instructions.txt", "r") as f:
-        instruction = f.read()
-    try:
-        with client.audio.speech.with_streaming_response.create(
-            model="gpt-4o-mini-tts",  # or tts-1-hd for higher quality
-            voice="echo",  # options: alloy, echo, fable, onyx, nova, shimmer
-            input=text,
-            #instructions="Speak in a natural tone with authority", 
-            instructions=instruction, 
-            ) as response:
-        
-            response.stream_to_file(output_path)
-        print(f"Speech saved to {output_path}")
-        return True
-    except Exception as e:
-        print(f"Error generating speech: {e}")
-        return False
 
-async def tts(tts_instructions, input_prompt, voice_model) -> None:
+# --- split TTS into generate + playback ------------
+
+async def tts_generate(instructions: str, text: str, voice: str) -> bytes:
+    """Generate TTS audio and return raw WAV bytes."""
     async with a_openai.audio.speech.with_streaming_response.create(
         model="gpt-4o-mini-tts",
-        voice=voice_model,
-        input=input_prompt,
-        instructions=tts_instructions,
-        response_format="wav",
-    ) as response:
-        gen_end = time.time()
-        await LocalAudioPlayer().play(response)
-    end=time.time()
-    print(f"Generation: {gen_end - start:.2f}s, Playback: {end - gen_end:.2f}s")
+        voice=voice,
+        input=text,
+        instructions=instructions,
+        response_format="wav"
+    ) as resp:
+        buf = bytearray()
+        # stream bytes correctly
+        try:
+            # prefer iter_bytes() if available
+            async for chunk in resp.iter_bytes():  # type: ignore
+                buf.extend(chunk)
+        except AttributeError:
+            # fallback: stream to a temp file then read
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+            tmp_path = tmp.name
+            tmp.close()
+            await resp.stream_to_file(tmp_path)
+            buf = Path(tmp_path).read_bytes()
+            os.remove(tmp_path)
+            return buf
+    return bytes(buf)
+
+
+def play_audio(audio_bytes: bytes):
+    """Play raw WAV bytes via PyAudio (runs in executor)."""
+    pa = pyaudio.PyAudio()
+    wf = wave.open(io.BytesIO(audio_bytes), 'rb')
+    stream = pa.open(
+        format=pa.get_format_from_width(wf.getsampwidth()),
+        channels=wf.getnchannels(),
+        rate=wf.getframerate(),
+        output=True
+    )
+    data = wf.readframes(1024)
+    while data:
+        stream.write(data)
+        data = wf.readframes(1024)
+    stream.stop_stream()
+    stream.close()
+    pa.terminate()
+
+
+async def pipeline(t0, args):
+    # ─── Setup CleanupAgent ───────────────────────────────────────────────
+    client = OpenAI()
+    transcript_path = f"./outputs/transcript_{t0}.txt"
+    #transcript_path = f"./outputs/Alex.txt"
+    cleanup_agent = CleanupAgent(
+        client,
+        transcript_path=transcript_path,
+        cleanup_prompt_path=args.cleanup,
+        response_prompt_path=args.response,
+    )
+
+    instruction = Path(args.tts).read_text()
+    voice_model = np.random.choice(["echo", "alloy", "onyx"])
+
+    # ─── Queues for text & audio ─────────────────────────────────────────
+    text_queue  = asyncio.Queue()
+    audio_queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    # Producer callback (runs in thread)
+    def on_sentence(sent: str):
+        loop.call_soon_threadsafe(text_queue.put_nowait, sent)
+
+    # Stage 1: launch cleanup streaming in executor
+    producer = loop.run_in_executor(None, cleanup_agent.stream_response, on_sentence)
+
+    # Stage 2: TTS‐generation worker
+    async def tts_worker():
+        while True:
+            sent = await text_queue.get()
+            if sent is None:
+                await audio_queue.put(None)
+                text_queue.task_done()
+                break
+            audio = await tts_generate(instruction, sent, voice_model)
+            await audio_queue.put(audio)
+            text_queue.task_done()
+
+    tts_task = asyncio.create_task(tts_worker())
+
+    # Stage 3: Playback worker
+    async def playback_worker():
+        while True:
+            audio = await audio_queue.get()
+            if audio is None:
+                audio_queue.task_done()
+                break
+            await loop.run_in_executor(None, play_audio, audio)
+            audio_queue.task_done()
+
+    playback_task = asyncio.create_task(playback_worker())
+
+    # ─── Tear‐down: wait for all stages ────────────────────────────────────
+    await producer
+    await text_queue.put(None)
+    await text_queue.join()
+    await tts_task
+
+    await audio_queue.join()
+    await playback_task
+
+
+async def run(t0):
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--cleanup',  type=str, default='./prompts/cleanup_prompt.txt')
+    parser.add_argument('--response', type=str, default='./prompts/response_prompt.txt')
+    parser.add_argument('--tts',      type=str, default='./prompts/tts_instructions.txt')
+    args = parser.parse_args()
+
+    await pipeline(t0, args)
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--cleanup', type=str, default='./prompts/cleanup_prompt.txt')
-    parser.add_argument('--response', type=str, default='./prompts/response_prompt.txt')
-    parser.add_argument('--tts', type=str, default='./prompts/tts_instructions.txt')
-    args = parser.parse_args()
-    t = time.time()
-    t = int(t)
-    asyncio.run(main(t))
-    client = OpenAI()
-    # Cleanup agent
-    start = time.time()
-    #transcript_path = "./outputs/transcript_"+str(t) + ".txt"
-    transcript_path = "./outputs/Alex.txt"
-    cleanup_agent = CleanupAgent(client,
-                                 transcript_path=transcript_path,
-                                 #cleanup_prompt_path="./prompts/cleanup_prompt.txt",
-                                 cleanup_prompt_path=args.cleanup,
-                                 #response_prompt_path="./prompts/response_prompt.txt",
-                                 response_prompt_path=args.response,
-                                 )
-    #cleanup_agent.run()
-    end = time.time()
-    print('#'*10)
-    print("time to clean up: ", end-start)
-    print('#'*10)
-    #start = time.time()
-    #response = cleanup_agent.respond_to_transcript()
-    #end = time.time()
-    print('#'*10)
-    print("time to responde: ", end-start)
-    print('#'*10)
-    # Convert text to speech
-    output_path = "./outputs/response_test_"+ str(t) + ".wav"
-    #text = response
-    start = time.time()
-    voice_model = np.random.choice(["echo", "alloy", "onyx"])
-    #with open("./prompts/tts_instructions.txt", "r") as f:
-    with open(args.tts, "r") as f:
-        instruction = f.read()
-
-    def speak(sentence: str):
-        asyncio.run(tts(instruction, sentence, voice_model))
-    cleanup_agent.stream_response(speak)
-    #asyncio.run(tts(instruction, text, voice_model))
-    #text_to_speech_openai(client, text, output_path)
-    end = time.time()
-    print('#'*10)
-    print("text to speech part", end-start)
-    print('#'*10)
-    #import subprocess
-    #subprocess.run(['open', output_path])
+    t0 = int(time.time())
+    asyncio.run(main(t0))      # 1) live transcription
+    asyncio.run(run(t0))       # 2) cleanup → generate → playback
