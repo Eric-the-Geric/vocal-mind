@@ -9,6 +9,7 @@ import pyaudio
 import wave
 import collections
 import logging
+import tempfile
 from pathlib import Path
 import time
 import numpy as np
@@ -35,6 +36,7 @@ final_transcription = ""
 
 OVERLAP_SECONDS = 5
 INTERVAL = 10
+
 def compute_overlap_chunks(rate, chunk_size, overlap_seconds=5):
     return int(rate * overlap_seconds / chunk_size) + 1
 
@@ -232,8 +234,6 @@ async def main(t):
         logger.error("Fatal error in transcription: %s", e)
 
 
-# --- split TTS into generate + playback ------------
-
 async def tts_generate(instructions: str, text: str, voice: str) -> bytes:
     """Generate TTS audio and return raw WAV bytes."""
     async with a_openai.audio.speech.with_streaming_response.create(
@@ -244,21 +244,19 @@ async def tts_generate(instructions: str, text: str, voice: str) -> bytes:
         response_format="wav"
     ) as resp:
         buf = bytearray()
-        # stream bytes correctly
+        # try streaming raw bytes
         try:
-            # prefer iter_bytes() if available
             async for chunk in resp.iter_bytes():  # type: ignore
                 buf.extend(chunk)
         except AttributeError:
-            # fallback: stream to a temp file then read
+            # fallback to temp file
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
             tmp_path = tmp.name
             tmp.close()
             await resp.stream_to_file(tmp_path)
             buf = Path(tmp_path).read_bytes()
             os.remove(tmp_path)
-            return buf
-    return bytes(buf)
+        return bytes(buf)
 
 
 def play_audio(audio_bytes: bytes):
@@ -284,7 +282,6 @@ async def pipeline(t0, args):
     # ─── Setup CleanupAgent ───────────────────────────────────────────────
     client = OpenAI()
     transcript_path = f"./outputs/transcript_{t0}.txt"
-    #transcript_path = f"./outputs/Alex.txt"
     cleanup_agent = CleanupAgent(
         client,
         transcript_path=transcript_path,
@@ -300,6 +297,10 @@ async def pipeline(t0, args):
     audio_queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
+    # Prepare a single WAV file to store all TTS output
+    tts_file = wave.open(f"./outputs/tts_stream_{t0}.wav", "wb")
+    first_chunk = True
+
     # Producer callback (runs in thread)
     def on_sentence(sent: str):
         loop.call_soon_threadsafe(text_queue.put_nowait, sent)
@@ -309,6 +310,7 @@ async def pipeline(t0, args):
 
     # Stage 2: TTS‐generation worker
     async def tts_worker():
+        nonlocal first_chunk
         while True:
             sent = await text_queue.get()
             if sent is None:
@@ -316,6 +318,18 @@ async def pipeline(t0, args):
                 text_queue.task_done()
                 break
             audio = await tts_generate(instruction, sent, voice_model)
+            # write audio to the combined file
+            buf = io.BytesIO(audio)
+            wf = wave.open(buf, "rb")
+            if first_chunk:
+                tts_file.setnchannels(wf.getnchannels())
+                tts_file.setsampwidth(wf.getsampwidth())
+                tts_file.setframerate(wf.getframerate())
+                first_chunk = False
+            frames = wf.readframes(wf.getnframes())
+            tts_file.writeframes(frames)
+            wf.close()
+
             await audio_queue.put(audio)
             text_queue.task_done()
 
@@ -341,6 +355,9 @@ async def pipeline(t0, args):
 
     await audio_queue.join()
     await playback_task
+
+    # close the combined TTS file
+    tts_file.close()
 
 
 async def run(t0):
