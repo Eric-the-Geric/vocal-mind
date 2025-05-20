@@ -1,4 +1,10 @@
-# Installation steps
+# Vocal Mind
+
+# Overview
+
+Vocal Mind is a real-time transcription and text-to-speech orchestration tool that leverages the OpenAI API and local audio hardware. It streams microphone input for live transcription, applies prompt-based transcript cleanup, and converts text responses back into speech.
+
+## Installation steps
 
 TLDR;
 
@@ -46,9 +52,31 @@ Prerequisites:
    ```bash
    export OPENAI_API_KEY="your_openai_api_key"
    ```
+# Roadmap & Improvements
+
+| Area                     | Suggestions                                                                                      |
+|--------------------------|--------------------------------------------------------------------------------------------------|
+| **Docs & onboarding**    | Add a project-purpose section to this README; show end-to-end usage examples                      |
+| **.gitignore hygiene**   | Don’t ignore `*.txt`/`*.wav` globally—only ignore generated outputs (e.g. `/outputs/*.wav`)      |
+| **Module cleanup**       | Remove or implement `src/voice.py`; break `main.py` into smaller modules (e.g. `transcribe.py`) |
+| **Configuration**        | Use a `.env` or config file for API key, model names, file paths; leverage `python-dotenv`      |
+| **CLI & UX**             | Add `argparse` flags for modes (`--transcribe`, `--clean`, `--tts`); expose rate/chunk size      |
+| **Prompt management**    | Version prompts; validate templates at startup                                                   |
+| **Error handling & logs**| Standardize on one logging framework (`logging` or `loguru`); handle network or hardware errors  |
+| **Testing & CI**         | Add unit tests for core logic; include CI for tests and linters                                  |
+| **Packaging**            | Provide a `pyproject.toml` or `setup.py` for `pip install`; pin dependency versions               |
+| **Repo hygiene**         | Move `outputs/` off-repo or trim it; add `/outputs/*` to `.gitignore`; remove large commits      |
+| **Pre-commit & linting** | Add pre-commit with Black/isort/flake8/mypy; hook spellcheck for prompts                         |
+
+In brief:
+- Document the project purpose in this README (not just installation).
+- Fix `.gitignore` to only ignore generated outputs, not all `.txt`/`.wav`.
+- Modularize the code: split `main.py`, remove unused files, add CLI.
+- Add tests and CI coverage for core functions and linting.
+
 6. Run the application:
    ```bash
-   python eric/testing_sockets/main.py
+   python main.py
    ```
 
 #TODO
