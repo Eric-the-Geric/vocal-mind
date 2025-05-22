@@ -281,8 +281,8 @@ def play_audio(audio_bytes: bytes):
 async def pipeline(t0, args):
     # ─── Setup CleanupAgent ───────────────────────────────────────────────
     client = OpenAI()
-    #transcript_path = f"./outputs/transcript_{t0}.txt"
-    transcript_path = "./outputs/Alex.txt"
+    transcript_path = f"./outputs/transcript_{t0}.txt"
+    #transcript_path = "./outputs/Alex.txt"
     cleanup_agent = CleanupAgent(
         client,
         transcript_path=transcript_path,
@@ -374,5 +374,5 @@ async def run(t0):
 
 if __name__ == "__main__":
     t0 = int(time.time())
-    #asyncio.run(main(t0))      # 1) live transcription
+    asyncio.run(main(t0))      # 1) live transcription
     asyncio.run(run(t0))       # 2) cleanup → generate → playback
